@@ -1,18 +1,39 @@
 #include "Arduino.h"
-#include "WiFiUDP.h"
+#include "EspWifi.h"
 #include "ESP8266WiFi.h"
-#include <WiFiClient.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
+#include "WiFiClient.h"
+#include "ESP8266mDNS.h"
+#include "WiFiUDP.h"
 #include "FS.h"
 #include "detail/RequestHandlersImpl.h"
 
 #ifdef _MQTT_SUPPORT
   #include "EspConfig.h"
+  #include "EspMqtt.h"
 #endif
 
 extern "C" {
 #include "user_interface.h"
+}
+
+DeviceConfigCallback deviceConfigCallback = NULL;
+void registerDeviceConfigCallback(DeviceConfigCallback callback) {
+  deviceConfigCallback = callback;
+}
+
+DeviceListCallback deviceListCallback = NULL;
+void registerDeviceListCallback(DeviceListCallback callback) {
+  deviceListCallback = callback;
+}
+
+DeviceConfigCallback scheduleConfigCallback = NULL;
+void registerScheduleConfigCallback(DeviceConfigCallback callback) {
+  scheduleConfigCallback = callback;
+}
+
+DeviceListCallback scheduleListCallback = NULL;
+void registerScheduleListCallback(DeviceListCallback callback) {
+  scheduleListCallback = callback;
 }
 
 // source: http://esp8266-re.foogod.com/wiki/SPI_Flash_Format
@@ -130,16 +151,16 @@ void setupSoftAP() {
   }
 }
 
-void configWifi(String action) {
-  Serial.print("configWifi: " + action);
-
-  if (action == "reset") {
+void configWifi() {
+  String ssid = server.arg("ssid");
+  
+  if (WiFi.SSID() != ssid && ssid == "") {
     WiFi.disconnect();  // clear ssid and psk in EEPROM
     delay(1000);
     statusWifi();
   }
-  if (action == "setup") {
-    reconfigWifi(server.arg("ssid"), server.arg("password"));
+  if (WiFi.SSID() != ssid && ssid != "") {
+    reconfigWifi(ssid, server.arg("password"));
   }
 
   httpRequestProcessed = true;
@@ -168,6 +189,10 @@ void setupHttp() {
 
   server.on("/config", HTTP_GET, httpHandleConfig);
   server.on("/config", HTTP_POST, httpHandleConfig);
+  server.on("/devices", HTTP_GET, httpHandleDevices);
+  server.on("/schedules", HTTP_GET, httpHandleSchedules);
+  server.on("/static/deviceList.css", HTTP_GET, httpHandleDeviceListCss);
+  server.on("/static/deviceList.js", HTTP_GET, httpHandleDeviceListJss);
   server.onNotFound(httpHandleNotFound);
   server.addHandler(new FunctionRequestHandler(httpHandleOTA, httpHandleOTAData, ("/ota/" + getChipID() + ".bin").c_str(), HTTP_POST));
 
@@ -177,12 +202,25 @@ void setupHttp() {
 
 void httpHandleRoot() {
   Serial.print("httpHandleRoot: ");
-  String message = "Hostname: ";
-  message += WiFi.hostname();
-  message += "\r\nChip:     " + getChipID();
-  message += "\r\nMAC:      ";
-  message += WiFi.macAddress();
-  message += "\r\nClient:   " + ipString(server.client().remoteIP());
+  // menu
+  String message = F("<div class=\"menu\"><a href=\"/devices\" class=\"dc\">Devices</a><a href=\"/schedules\" class=\"dc\">Schedules</a>");
+#ifdef _MQTT_SUPPORT
+  message += "<a id=\"mqtt\" class=\"dc\">MQTT</a>";
+#endif
+  message += "<a id=\"ota\" class=\"dc\">OTA</a>";
+  message += "<sp>" + uptime() + "</sp></div>";
+
+  // wifi
+  String html = "<table><tr><td>ssid:</td><td>" + WiFi.SSID() + "</td><td><a id=\"wifi\" class=\"dc\">...</a></td></tr>";
+  if (WiFi.status() == WL_CONNECTED) {
+    html += F("<tr><td>Status:</td><td>connected</td><td></td></tr>");
+    html += F("<tr><td>Hostname:</td><td>"); html += WiFi.hostname(); html += F(" (MAC: "); html += WiFi.macAddress();html += F(")</td><td></td></tr>");
+    html += F("<tr><td>IP:</td><td>"); html += ipString(WiFi.localIP()); html += F("/"); html +=ipString(WiFi.subnetMask()); html += F(" "); html += ipString(WiFi.gatewayIP()); html += F("</td><td></td></tr>");
+  } else {
+    html += F("<tr><td>Status:</td><td>disconnected</td><td></td></tr>");
+  }
+  html += F("</table>");
+  message += htmlFieldSet(html, "WiFi");
 
   server.client().setNoDelay(true);
   server.send(200, "text/html", htmlBody(message));
@@ -219,10 +257,87 @@ void httpHandleConfig() {
       server.client().setNoDelay(true);
       server.send(403, "text/plain", "Forbidden");
       httpRequestProcessed = true;
+      return;
+    }
+
+#ifdef _DEBUG_HTTP
+    for (int i=0; i<server.args();i++) {
+      Serial.println("#" + String(i) + " '" + server.argName(i) + "' = '" + server.arg(i) + "'");
+    }
+#endif
+
+    if (server.arg("deviceID") != "") {
+      String result = "";
+      uint16_t resultCode;
+      if (deviceConfigCallback != NULL && (result = deviceConfigCallback(&server, &resultCode))) {
+        server.client().setNoDelay(true);
+        server.send(resultCode, "text/html", result);
+        httpRequestProcessed = true;
+        return;
+      }
+
+      server.client().setNoDelay(true);
+      server.send(403, "text/plain", "Forbidden");
+      httpRequestProcessed = true;
+      return;
+    }
+    
+    if (server.hasArg("schedule") && server.arg("schedule") != "") {
+      uint16_t resultCode = 0;
+      String result;
+      
+      if (scheduleConfigCallback != NULL)
+        result = scheduleConfigCallback(&server, &resultCode);
+
+      Serial.print("resultCode: " + String(resultCode) + " ");
+      switch (resultCode) {
+        case 200:
+          server.client().setNoDelay(true);
+          server.send(resultCode, "text/html", result);
+          break;
+        case 303:
+          server.client().setNoDelay(true);
+          server.sendHeader("Location", "/schedules");
+          server.send(303, "text/plain", "See Other");
+          break;
+        default:
+          server.client().setNoDelay(true);
+          server.send(403, "text/plain", "Forbidden");
+          break;
+      }
+
+      httpRequestProcessed = true;
+      return;
+    }
+
+    if (server.hasArg("resetSearch") && server.arg("resetSearch")== "") {
+      esp1wire.resetSearch();
+      server.client().setNoDelay(true);
+      server.send(200, "text/html", "ok");
+      httpRequestProcessed = true;
+      return;
+    }
+    
+    if (server.hasArg("ota") && server.arg("ota")== "") {
+      String result = F("<h4>OTA</h4>");
+      result += flashForm();
+      server.client().setNoDelay(true);
+      server.send(200, "text/html", result);
+      httpRequestProcessed = true;
+      return;
+    }
+    
+    if (server.hasArg("wifi") && server.arg("wifi")== "") {
+      String result = F("<h4>WiFi</h4>");
+      result += wifiForm();
+      server.client().setNoDelay(true);
+      server.send(200, "text/html", result);
+      httpRequestProcessed = true;
+      return;
     }
     
     if (server.arg("wifi") == "submit") {
-      configWifi(server.arg("action"));
+      configWifi();
       server.client().setNoDelay(true);
       server.sendHeader("Location", "/");
       server.send(303, "text/plain", "See Other");
@@ -230,20 +345,24 @@ void httpHandleConfig() {
     }
 
 #ifdef _MQTT_SUPPORT
-Serial.println("mqtt: " + server.arg("mqtt"));
-    if (server.arg("mqtt") == "submit") {
-      if (server.arg("action") == "test") {
-        espConfig.setValue("mqttServer", server.arg("server"));
-        espConfig.setValue("mqttPort", server.arg("port"));
-        espConfig.setValue("mqttUser", server.arg("user"));
-        espConfig.setValue("mqttPassword", server.arg("password"));
-//        configEspMqtt();
-      } else if (server.arg("action") == "setup") {
-        espConfig.saveToFile();
-      }
+    if (server.hasArg("mqtt") && server.arg("mqtt") == "") {
+      String result = F("<h4>MQTT</h4>");
+      result += mqttForm();
       server.client().setNoDelay(true);
-      server.sendHeader("Location", "/");
-      server.send(303, "text/plain", "See Other");
+      server.send(200, "text/html", result);
+      httpRequestProcessed = true;
+      return;
+    }
+    
+    if (server.arg("mqtt") == "submit") {
+      if (espMqtt.testConfig(server.arg("server"), server.arg("port"), server.arg("user"), server.arg("password"))) {
+        server.client().setNoDelay(true);
+        server.send(200, "text/plain", "ok");
+      } else {
+        server.client().setNoDelay(true);
+        server.send(304, "text/plain", "MQTT connection test failed!");
+      }
+      httpRequestProcessed = true;
       return;
     }
 #endif
@@ -270,6 +389,97 @@ Serial.println("mqtt: " + server.arg("mqtt"));
   
   server.client().setNoDelay(true);
   server.send(200, "text/plain", message);
+  httpRequestProcessed = true;
+}
+
+void httpHandleDevices() {
+  Serial.print("httpHandleDevices: ");
+  String message = "", devList = "";
+
+  if (server.method() == HTTP_GET) {
+    if (deviceListCallback != NULL && (devList = deviceListCallback()) != "") {
+#ifdef _DEBUG_TIMING
+      unsigned long sendStart = micros();
+#endif
+      message = F("<div class=\"menu\"><a id=\"resetSearch\" class=\"dc\">resetSearch</a><sp><a id=\"back\" class=\"dc\">Back</a></sp></div>");
+      String html = F("<table id=\"devices\"><thead><tr><th>Name</th><th>Type</th></tr></thead>");
+      html += devList;
+      html += F("</table>");
+      String options = htmlOption("255", F("All"), true);
+      options += htmlOption("18", F("Battery"));
+      options += htmlOption("8", F("Counter"));
+      options += htmlOption("4", F("Switch"));
+      options += htmlOption("2", F("Temperature"));
+      String legend = htmlSelect(F("filter"), options, F("javascript:filter();"));
+      legend += F(" Devices");
+      message += htmlFieldSet(html, legend);
+
+      server.client().setNoDelay(true);
+      server.send(200, "text/html", htmlBody(message));
+
+#ifdef _DEBUG_TIMING
+      Serial.print("send " + elapTime(sendStart) + " ");
+#endif
+      httpRequestProcessed = true;
+      return;
+    }
+  }
+  
+  server.client().setNoDelay(true);
+  server.send(403, "text/plain", "Forbidden");
+  httpRequestProcessed = true;
+}
+
+void httpHandleSchedules() {
+  Serial.print("httpHandleSchedules: ");
+  String message = "", schedList = "";
+
+  if (server.method() == HTTP_GET) {
+    if (scheduleListCallback != NULL && (schedList = scheduleListCallback()) != "") {
+#ifdef _DEBUG_TIMING
+      unsigned long sendStart = micros();
+#endif
+      // menu
+      message = F("<div class=\"menu\"><a class=\"dc\" id=\"schedule#add\">Add</a><a id=\"back\" class=\"dc\" style=\"float: right;\">Back</a></div>");
+      // schedules
+      message += htmlFieldSet(schedList, "Schedules");
+
+      server.client().setNoDelay(true);
+      server.send(200, "text/html", htmlBody(message));
+
+#ifdef _DEBUG_TIMING
+      Serial.print("send " + elapTime(sendStart) + " ");
+#endif
+      httpRequestProcessed = true;
+      return;
+    }
+  }
+  
+  server.client().setNoDelay(true);
+  server.send(403, "text/plain", "Forbidden");
+  httpRequestProcessed = true;
+}
+
+void httpHandleDeviceListCss() {
+  Serial.print("httpHandleDeviceListCss: ");
+  server.sendHeader("Cache-Control", "public, max-age=86400");
+  server.client().setNoDelay(true);
+  String css = F(".menu{height:1.3em;padding:5px 5px 5px 5px;margin-bottom:5px;background-color:#E0E0E0;}.menu .dc{float:left;}.menu sp{float: right;}label{width:4em;text-align:left;display:inline-block;} input[type=text]{margin-bottom:2px;} table td{padding:5px 15px 0px 0px;} table th{text-align:left;} fieldset{margin:0px 10px 10px 10px;max-height:20em;overflow:auto;} legend select{margin-right:5px;}");
+  css += F(".dc{border:1px solid #A0A0A0;border-radius:5px;padding:0px 3px 0px 3px;}a.dc{color:black;text-decoration:none;margin-right:3px;outline-style:none;}.dc:hover{border:1px solid #5F5F5F;background-color:#D0D0D0;cursor:pointer;} #mD{background:rgba(0,0,0,0.5);visibility:hidden;position:absolute;top:0;left:0;width:100%;height:100%;z-index:1;padding-top:10%;} #mDC{border:1px solid #A0A0A0;border-radius:5px;background:rgba(255,255,255,1);margin:auto;display:inline-block;} #mDCC label{margin-left:10px;width:8em;text-align:left;display:inline-block;} #mDCC select,input{margin:5px 10px 0px 10px;width:13em;display:inline-block;} #mDCB{float:right;margin:10px 10px 10px 10px;} #mDCB a{margin:0px 2px 0px 2px;}");
+  server.send(200, "text/css", css);
+  httpRequestProcessed = true;
+}
+
+void httpHandleDeviceListJss() {
+  Serial.print("httpHandleDeviceListJss: ");
+  server.sendHeader("Cache-Control", "public, max-age=86400");
+  server.client().setNoDelay(true);
+  String script = F("function windowClick(e){if(e.target.className==\"dc\"&&e.target.id){modDlg(true,false,e.target.id);}}function modDlg(open,save,id){if(id=='back'){history.back();return;}document.onkeypress=(open?function(evt){evt=evt||window.event;var charCode=evt.keyCode||evt.which;if(charCode==27)modDlg(false,false);if(charCode==13)modDlg(false,true);}:null);var md=document.getElementById('mD');if(save){var form=document.getElementById('submitForm');if(form){form.submit();return;}form=document.getElementById('configForm');if(form){var aStr=form.action;var idx=aStr.indexOf('?');var url=aStr.substr(0, idx + 1);var params='';var elem;var parse;aStr=aStr.substr(idx + 1);while(1){idx=aStr.indexOf('&');if(idx>0)parse=aStr.substr(0, idx);else parse=aStr;");
+  script += F("if(parse.substr(parse.length-1)!='='){params+=parse+'&';}else{elem=document.getElementsByName(parse.substr(0,parse.length-1));if(elem && elem[0])params+=parse+elem[0].value+'&';}if(idx>0) aStr=aStr.substr(idx+1); else break;}try{var xmlHttp=new XMLHttpRequest();xmlHttp.open('POST',url+params,false);xmlHttp.send(null);if(xmlHttp.status!=200){alert('Fehler: '+xmlHttp.statusText);return;}}catch(err){alert('Fehler: '+err.message);return;}}}if(open){try{var url='/config?ChipID=");
+  script += getChipID();
+  script += F("&action=form';if(id.indexOf('schedule#')==0)url+='&schedule='+id.substr(9);else if(id=='mqtt'||id=='wifi'||id=='ota'||id=='resetSearch')url+='&'+id+'=';else url+='&deviceID='+id;var xmlHttp=new XMLHttpRequest(); xmlHttp.open('POST',url,false);xmlHttp.send(null);if(xmlHttp.status != 200){alert('Fehler: '+xmlHttp.statusText);return;}if(id=='resetSearch'){window.location.reload();return;}document.getElementById('mDCC').innerHTML=xmlHttp.responseText;}catch(err){alert('Fehler: '+err.message);return;}}md.style.visibility=(open?'visible':'hidden');if(!open){document.getElementById('mDCC').innerHTML='';}}");
+  script += F("function filter(){var filter=document.getElementsByName('filter')[0];var table=document.getElementById('devices');if(filter&&table){var trs=document.getElementsByTagName('tr');i=1;while(trs[i]){trs[i].style.display=((filter.value&trs[i].firstChild.nodeValue)==filter.value||filter.value==255?'table-row':'none');i++;}}}");
+  server.send(200, "text/javascript", script);
   httpRequestProcessed = true;
 }
 
@@ -311,7 +521,7 @@ void clearOtaFile() {
 }
 
 void httpHandleOTA() {
-  String message = "httpHandleOTA: ";
+  String message = "\n\nhttpHandleOTA: ";
   bool doUpdate = false;
   
   if (SPIFFS.exists(otaFileName) && initOtaFile(otaFileName, "r")) {
@@ -328,9 +538,8 @@ void httpHandleOTA() {
   Serial.println(message);
 
   server.client().setNoDelay(true);
-//  server.sendHeader("Location", "/");
-//  server.send(303, "text/plain", "See Other");
-  server.send(200, "text/plain", message);
+  server.sendHeader("Location", "/");
+  server.send(303, "text/plain", "See Other");
 
   if (doUpdate) {
     Serial.print("starting Update: ");
@@ -365,7 +574,7 @@ void httpHandleOTAData() {
       Serial.printf(", magic: 0x%0x, size: 0x%0x, speed: 0x%0x\n", otaHeader.magic, ((otaHeader.flash_size_speed & 0xf0) >> 4), (otaHeader.flash_size_speed & 0x0f));
 
       if (otaHeader.magic == 0xe9)
-        initOtaFile("/ota/" + upload.filename, "w");
+        initOtaFile("/ota/" + getChipID() + ".bin", "w");
     }
     Serial.print(".");
     if ((upload.totalSize % HTTP_UPLOAD_BUFLEN) == 20)

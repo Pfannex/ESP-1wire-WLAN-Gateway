@@ -1,18 +1,28 @@
 #include "Esp1wire.h"
 
 Esp1wire::Esp1wire() {
+  firstBus = lastBus = NULL;
 }
 
 #ifdef _DEBUG_TEST_DATA
 void Esp1wire::testData() {
 // test crap
 
-  uint8_t data[2] = { 0xFF, 0x5E };
-  int16_t fpTemperature =
-    (((int16_t) data[0]) << 11) |
-    (((int16_t) data[1]) << 3);
-  float temperature = (float)fpTemperature * 0.0078125;
-  Serial.println("temperature = " + String(temperature));
+// *** address crc test ***
+//uint8_t address[8] = { 0x1d, 0x3a, 0x00, 0x00, 0x00, 0x00, 0x01 , 0x98 };
+//uint8_t crc = OneWire::crc8(address, 7);
+//Serial.println("testData: " + HelperDevice::getOneWireDeviceID(address) + ", crc 0x" + String(crc, HEX) + " " + String(crc == address[7] ? "ok" : "wrong"));
+//uint8_t address2[8] = { 0x29, 0xa3, 0x00, 0x00, 0x00, 0x00, 0x01, 0x78 };
+//crc = OneWire::crc8(address2, 7);
+//Serial.println("testData: " + HelperDevice::getOneWireDeviceID(address2) + ", crc 0x" + String(crc, HEX) + " " + String(crc == address2[7] ? "ok" : "wrong"));
+
+// *** runtime test - number conversion ***
+//  uint8_t data[2] = { 0xFF, 0x5E };
+//  int16_t fpTemperature =
+//    (((int16_t) data[0]) << 11) |
+//    (((int16_t) data[1]) << 3);
+//  float temperature = (float)fpTemperature * 0.0078125;
+//  Serial.println("temperature = " + String(temperature));
 }
 #endif
 
@@ -31,6 +41,9 @@ bool Esp1wire::probeI2C(uint8_t sda, uint8_t scl) {
   // probe I2C busmaster
   for (byte i = 0; i <= 3; i++) {
     byte addr = (0x18 | i);
+
+    if (busAddressInUse(addr))
+      continue;
     Wire.beginTransmission(addr);
     byte error = Wire.endTransmission();
 
@@ -51,6 +64,7 @@ bool Esp1wire::probeI2C(uint8_t sda, uint8_t scl) {
 }
 
 bool Esp1wire::probeGPIO(uint8_t gpio) {
+
 #ifdef _DEBUG_SETUP
   Serial.print("\nprobe gpio #" + (String)gpio + ": ");
 #endif
@@ -128,24 +142,23 @@ Esp1wire::AlarmFilter Esp1wire::alarmSearch(DeviceType targetSearch) {
   BusList *curr = firstBus;
 
   freeAlarmFilter();
-  alarmFilter = new AlarmFilter();
 
   uint8_t bus = 1;
   while (curr != NULL) {
-#if defined(_DEBUG_TIMING) || defined(_DEBUG_SETUP)
+#if defined(_DEBUG_TIMING)
     Serial.print("bus #" + (String)bus + ": alarm search ");
     unsigned long start = micros();
 #endif
-    curr->bus->alarmSearch(alarmFilter, targetSearch);
+    curr->bus->alarmSearch(targetSearch);
 
-#if defined(_DEBUG_TIMING) || defined(_DEBUG_SETUP)
+#if defined(_DEBUG_TIMING)
     Serial.println(" " + elapTime(start));
 #endif
     curr = curr->next;
     bus++;
   }
 
-  return *alarmFilter;
+  return AlarmFilter(alarmFirst);
 }
 
 bool Esp1wire::requestTemperatures (bool resetIgnoreAlarmFlags) {
@@ -171,32 +184,49 @@ bool Esp1wire::requestTemperatures (bool resetIgnoreAlarmFlags) {
   }
 }
 
-bool Esp1wire::requestBatteries() {
-  BusList *curr = firstBus;
+void Esp1wire::addAlarmFilter(Device *device) {
+  if (device->getIgnoreAlarmSearch())
+    return;
 
-  uint8_t bus = 1;
-  while (curr != NULL) {
-    if (curr->bus->getTemperatureDeviceCount() > 0) {
-#if defined(_DEBUG_TIMING) || defined(_DEBUG)
-      Serial.print("\nbus #" + (String)bus + ": request batteries ");
-      unsigned long start = micros();
-#endif
-      HelperBatteryDevice::requestBatteries(curr->bus);
-#if defined(_DEBUG_TIMING) || defined(_DEBUG)
-      Serial.println(" " + elapTime(start));
-#endif
-    }
+  if (alarmFirst == NULL) {
+    alarmFirst = alarmLast = new Bus::DeviceList();
+    alarmFirst->device = device;
+    alarmFirst->next = NULL;
+  } else {
+    Bus::DeviceList *newList = new Bus::DeviceList();
+    newList->device = device;
+    newList->next = NULL;
 
-    curr = curr->next;
-    bus++;
+    alarmLast->next = newList;
+    alarmLast = newList;
   }
 }
 
 void Esp1wire::freeAlarmFilter() {
-  if (alarmFilter != NULL) {
-    free(alarmFilter);
-    alarmFilter = NULL;
+  Bus::DeviceList *currList;
+
+  while (alarmFirst != NULL) {
+    currList = alarmFirst->next;
+    delete alarmFirst;
+    alarmFirst = currList;
   }
+
+  // global variables
+  alarmFirst = NULL;
+  alarmLast = NULL;
+}
+
+bool Esp1wire::busAddressInUse(uint8_t busAddress) {
+  BusList *curr = firstBus;
+
+  while (curr != NULL) {
+    if (curr->bus->busAddressInUse(busAddress)) {
+      return true;
+    }
+    curr = curr->next;
+  }
+
+  return false;
 }
 
 // class Esp1wire Busmaster
@@ -247,6 +277,11 @@ void Esp1wire::Busmaster::wireResetSearch() {
     searchAddress[i] = 0;
 }
 
+void Esp1wire::Busmaster::target_search(OneWireDeviceType oneWireDeviceType) {
+  searchAddress[0] = oneWireDeviceType;
+  searchLastDiscrepancy = 64;
+}
+
 uint8_t Esp1wire::Busmaster::busyWait(bool setReadPtr) {
   uint8_t status;
   int loopCount = 1000;
@@ -262,19 +297,10 @@ uint8_t Esp1wire::Busmaster::busyWait(bool setReadPtr) {
   return status;
 }
 
-bool Esp1wire::Busmaster::wireSearch(uint8_t *address, bool alarm, DeviceType targetSearch) {
+bool Esp1wire::Busmaster::wireSearch(uint8_t *address, bool alarm) {
   uint8_t i;
   uint8_t direction;
   uint8_t last_zero = 0;
-
-  // use target search for switches
-  if (alarm)
-    switch (targetSearch) {
-      case DeviceTypeSwitch:
-        searchAddress[0] = DS2406;
-        searchLastDiscrepancy = 64;
-        break;
-    }
 
   if (searchExhausted || !wireReset())
     return false;
@@ -350,14 +376,17 @@ void Esp1wire::Bus::registerTemperatureDevice(bool parasite, uint8_t resolution)
     mStatus |= resolution;
 }
 
-void Esp1wire::Bus::deviceDetected(uint8_t *address) {
+Esp1wire::Device *Esp1wire::Bus::deviceDetected(uint8_t *address) {
   DeviceType deviceType = getDeviceType(address);
+#ifdef _DEBUG_DETECTION
+  Serial.print(HelperDevice::getOneWireDeviceID(address) + " ");
+#endif
 
   if (this->crc8(address, 7) != address[7]) {
 #ifdef _DEBUG_SETUP
     Serial.print(HelperDevice::getOneWireDeviceID(address) + " (crc error)");
 #endif
-    return;
+    return NULL;
   }
 
   // add first device
@@ -370,7 +399,7 @@ void Esp1wire::Bus::deviceDetected(uint8_t *address) {
 #ifdef _DEBUG_SETUP
     Serial.print(".");
 #endif
-    return;
+    return firstDevice->device;
   }
 
   // probe last device
@@ -386,7 +415,7 @@ void Esp1wire::Bus::deviceDetected(uint8_t *address) {
 #ifdef _DEBUG_SETUP
     Serial.print(".");
 #endif
-    return;
+    return deviceList->device;
   }
 
   // probe whole list
@@ -418,11 +447,35 @@ void Esp1wire::Bus::deviceDetected(uint8_t *address) {
     deviceList->device = new Device(this, address, deviceType);
     deviceList->next = currDevice;
 
-    if (prevDevice == firstDevice)
+    if (currDevice == firstDevice)
       firstDevice = deviceList;
     else
       prevDevice->next = deviceList;
+    mDeviceListCount++;
+    
+    return deviceList->device;  // leaf while after insert
   }
+}
+
+void Esp1wire::Bus::alarmSearchHandleFound(uint8_t *address) {
+  while (currDevice != NULL) {
+    int8_t addrComp = ((HelperDevice*)currDevice->device)->compareAddress(address);
+    if (addrComp == 0) {
+      esp1wire.addAlarmFilter(currDevice->device);
+      return;
+    }
+    if (addrComp < 0) {
+      currDevice = currDevice->next;
+      continue;
+    }
+
+    // found new device
+    break;
+  }
+
+  Device *newDevice = deviceDetected(address);
+  if (newDevice != NULL)
+    esp1wire.addAlarmFilter(newDevice);
 }
 
 Esp1wire::DeviceType Esp1wire::Bus::getDeviceType(uint8_t *address) {
@@ -437,6 +490,7 @@ Esp1wire::DeviceType Esp1wire::Bus::getDeviceType(uint8_t *address) {
       deviceType = DeviceTypeTemperature;
       break;
     case DS2406:
+    case DS2408:
       deviceType = DeviceTypeSwitch;
       break;
     case DS2423:
@@ -476,6 +530,18 @@ void Esp1wire::Bus::wireWriteBytes(uint8_t *bytes, uint8_t len) {
 // class Esp1wire BusIC
 Esp1wire::BusIC::BusIC(Busmaster *busmaster) {
   mBusmaster = busmaster;
+
+#ifdef _DEBUG_DUMMY_DEVICES
+//  // dummy battery
+//  uint8_t batt[8] = { 0x26, 0xe4, 0x21, 0x71, 0x01, 0x00, 0x00, 0x2d };
+//  deviceDetected(batt);
+//  // dummy counter
+//  uint8_t cnt[8] = { 0x1d, 0xa2, 0x00, 0x00, 0x00, 0x00, 0x01, 0xaf };
+//  deviceDetected(cnt);
+  // dummy DS2408
+  uint8_t sw8[8] = { 0x29, 0xa3, 0x00, 0x00, 0x00, 0x00, 0x01, 0x78 };
+  deviceDetected(sw8);
+#endif
 }
 
 Esp1wire::BusIC::BusIC(Busmaster *busmaster, uint8_t channel) {
@@ -499,29 +565,41 @@ bool Esp1wire::BusIC::resetSearch() {
   return true;
 }
 
-bool Esp1wire::BusIC::alarmSearch(AlarmFilter *alarmFilter, DeviceType targetSearch) {
+bool Esp1wire::BusIC::alarmSearch(DeviceType targetSearch) {
+  currDevice = firstDevice;    // init global variable
+
   selectChannel();
   wireResetSearch();
 
-  uint8_t address[8];
-  DeviceList *currList = firstDevice;    // set to first element
+  // use target search for switches
+  switch (targetSearch) {
+    case DeviceTypeSwitch:
+      mBusmaster->target_search(DS2406);
+      alarmSearchIntern(targetSearch);
+      wireResetSearch();
+      mBusmaster->target_search(DS2408);
+    default:
+      alarmSearchIntern(targetSearch);
+      break;
+  }
 
-  while (mBusmaster->wireSearch(address, true, targetSearch)) {
-    while (currList != NULL) {
-      int8_t addrComp = ((HelperDevice*)currList->device)->compareAddress(address);
-      if (addrComp == 0) {
-        ((HelperAlarmFilter*)alarmFilter)->addDevice(currList->device);
-        break;
-      }
-      if (addrComp < 0) {
-        currList = currList->next;
-        continue;
-      }
-      if (addrComp > 0) {
-        Serial.println("BusIC::alarmSearch: new device found " + HelperDevice::getOneWireDeviceID(address));
-        break;
-      }
-    }
+  return true;
+}
+
+bool Esp1wire::BusIC::alarmSearchIntern(DeviceType targetSearch) {
+  uint8_t address[8], last[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+  while (mBusmaster->wireSearch(address, true)) {
+    // found device that doesn't match family code
+    if (targetSearch != DeviceTypeAll && getDeviceType(address) != targetSearch)
+      break;
+
+    // prevent infinite loop (forced by an fixed bug in Busmaster::wireSearch)
+    if (HelperDevice::compareAddress(address, last) == 0)
+      break;
+    memcpy(last, address, sizeof(address));
+
+    alarmSearchHandleFound(address);
   }
 
   return true;
@@ -595,7 +673,10 @@ bool Esp1wire::BusGPIO::resetSearch() {
   return true;
 }
 
-bool Esp1wire::BusGPIO::alarmSearch(AlarmFilter *alarmFilter, DeviceType targetSearch) {
+
+bool Esp1wire::BusGPIO::alarmSearch(DeviceType targetSearch) {
+  currDevice = firstDevice;
+
   if (!mOneWire->reset())
     return false;
   wireResetSearch();
@@ -604,29 +685,33 @@ bool Esp1wire::BusGPIO::alarmSearch(AlarmFilter *alarmFilter, DeviceType targetS
   switch (targetSearch) {
     case DeviceTypeSwitch:
       mOneWire->target_search(DS2406);
+      alarmSearchIntern(targetSearch);
+      wireResetSearch();
+      mOneWire->target_search(DS2408);
+    default:
+      alarmSearchIntern(targetSearch);
       break;
   }
 
-  uint8_t address[8];
-  DeviceList *currList = firstDevice;
+  return true;
+}
 
-  while (mOneWire->search(address, true))
-    while (currList != NULL) {
-      int8_t addrComp = ((HelperDevice*)currList->device)->compareAddress(address);
-      if (addrComp == 0) {
-        ((HelperAlarmFilter*)alarmFilter)->addDevice(currList->device);
-        break;
-      }
-      if (addrComp < 0) {
-        currList = currList->next;
-        continue;
-      }
-      if (addrComp > 0) {
-        Serial.println("BusGPIO::alarmSearch: new device found " + HelperDevice::getOneWireDeviceID(address));
-        break;
-      }
-    }
+bool Esp1wire::BusGPIO::alarmSearchIntern(DeviceType targetSearch) {
+  uint8_t address[8], last[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
+  while (mOneWire->search(address, false)) {
+    // found device that doesn't match family code
+    if (targetSearch != DeviceTypeAll && getDeviceType(address) != targetSearch)
+      break;
+
+    // prevent infinite loop
+    if (HelperDevice::compareAddress(address, last) == 0)
+      break;
+    memcpy(last, address, sizeof(address));
+
+    alarmSearchHandleFound(address);
+  }
+  
   return true;
 }
 
@@ -673,6 +758,8 @@ Esp1wire::Device::Device(Bus *bus, uint8_t *address, DeviceType deviceType) {
   mDeviceType = deviceType;
 
   if (deviceType == DeviceTypeTemperature) {
+    ((TemperatureDevice*)this)->readConfig();
+
     uint8_t data[9];
     TemperatureDevice::TemperatureResolution tempRes = TemperatureDevice::resolutionUnknown;
     if (HelperTemperatureDevice::readScratch(mBus, mAddress, data)) {
@@ -693,6 +780,7 @@ Esp1wire::Device::Device(Bus *bus, uint8_t *address, DeviceType deviceType) {
 #ifdef _DEBUG
     Serial.print("Device::Device: switch ");
 #endif
+    ((SwitchDevice*)this)->readConfig();
     SwitchDevice::SwitchMemoryStatus memoryStatus;
     if (HelperSwitchDevice::readStatus(mBus, mAddress, &memoryStatus) && memoryStatus.parasite) {
         mStatus |= statusParasiteOn;
@@ -719,6 +807,7 @@ Esp1wire::Device::Device(Bus *bus, uint8_t *address, DeviceType deviceType) {
 #endif
   }
   if (deviceType == DeviceTypeBattery) {
+    ((BatteryDevice*)this)->readConfig();
     bool powerSupply = false;
     mStatus |= statusParasiteRead;
     if (powerSupply)
@@ -731,9 +820,6 @@ Esp1wire::Device::Device(Bus *bus, uint8_t *address, DeviceType deviceType) {
 }
 
 String Esp1wire::Device::getName() {
-  if (mDeviceType == DeviceTypeUnsupported)
-    return (String)F("unsupported type 0x") + String(mAddress[0], HEX);
-
   switch (mAddress[0]) {
     case DS18S20:
       return F("DS18S20");
@@ -753,15 +839,22 @@ String Esp1wire::Device::getName() {
     case DS2406:
       return F("DS2406");
       break;
+    case DS2408:
+      return F("DS2408"); // unsupported type 
+      break;
     case DS2423:
       return F("DS2423");
       break;
     case DS2438:
       return F("DS2438");
       break;
+    case DS1990:
+      return F("unsupported type DS1990");
+      break;
+    default:
+      return (String)F("unsupported type 0x") + String(mAddress[0], HEX);
+      break;
   }
-
-  return "Device::getName: 0x" + String(mAddress[0], HEX);
 }
 
 String Esp1wire::Device::getOneWireDeviceID() {
@@ -779,14 +872,27 @@ String Esp1wire::HelperDevice::getOneWireDeviceID(uint8_t *address) {
 }
 
 int8_t Esp1wire::HelperDevice::compareAddress(uint8_t *address) {
+  return HelperDevice::compareAddress(mAddress, address);
+}
+
+int8_t Esp1wire::HelperDevice::compareAddress(uint8_t *addr1, uint8_t *addr2) {
   for (byte i = 0; i < 8; i++) {
-    if (mAddress[i] < address[i])
+    if (addr1[i] < addr2[i])
       return -1;
-    if (mAddress[i] > address[i])
+    if (addr1[i] > addr2[i])
       return 1;
   }
 
   return 0;
+}
+
+bool Esp1wire::HelperDevice::isConversionComplete(Bus *bus) {
+  if (bus->parasite())  // no completion in parasite mode
+    return false;
+
+  uint8_t b = bus->wireReadBit();
+
+  return (b == 1);
 }
 
 // class TemperatureDevice
@@ -896,7 +1002,7 @@ bool Esp1wire::TemperatureDevice::requestTemperatureC(float *temperature) {
 
   bool result;
 
-  if ((result = HelperTemperatureDevice::requestTemperatures(mBus, mAddress)))
+  if ((result = HelperTemperatureDevice::requestTemperature(mBus, mAddress)))
     result = readTemperatureC(temperature);
 
   return result;
@@ -910,6 +1016,20 @@ Esp1wire::TemperatureDevice::TemperatureResolution Esp1wire::TemperatureDevice::
     return res;
 
   return HelperTemperatureDevice::resolution(mAddress, data);
+}
+
+void Esp1wire::TemperatureDevice::readConfig() {
+  EspDeviceConfig devConf = espConfig.getDeviceConfig(getOneWireDeviceID());
+
+  String value = devConf.getValue(F("conditionalSearch"));
+  int8_t idx;
+  if ((idx = value.indexOf(",")) > 0) {  // min & max
+    int8_t min = value.substring(0, idx).toInt();
+    int8_t max = value.substring(idx + 1, value.length()).toInt();
+
+    if (min != 0 && max != 0 && min <= max)
+      setAlarmTemperatures(min, max);
+  }
 }
 
 // class SwitchDevice
@@ -947,8 +1067,20 @@ bool Esp1wire::SwitchDevice::setConditionalSearch(ConditionalSearchPolarity csPo
   if (mDeviceType != DeviceTypeSwitch)
     return false;
 
-  uint8_t data[1] =  { channelFlipFlop | csChannelSelect | csSourceSelect | csPolarity };
-  return HelperSwitchDevice::writeStatus(mBus, mAddress, data);
+  bool result = false;
+
+  uint8_t data[3] =  { channelFlipFlop | csChannelSelect | csSourceSelect | csPolarity, 0x00, 0x00 };
+  
+  switch(getOneWireDeviceType()) {
+    case DS2406:
+      result = HelperSwitchDevice::writeStatus(mBus, mAddress, data);
+      break;
+    default:
+      Serial.println("SwitchDevice::setConditionalSearch: " + getOneWireDeviceID() + " unsupported");
+      break;
+  }
+
+  return result;
 }
 
 bool Esp1wire::SwitchDevice::resetAlarm(SwitchChannelStatus *channelStatus) {
@@ -962,9 +1094,34 @@ bool Esp1wire::SwitchDevice::resetAlarm(SwitchChannelStatus *channelStatus) {
   return channelAccessInfo(&resetStatus, true);
 }
 
+// DS2408
+bool Esp1wire::SwitchDevice::readChannelAccess(uint8_t data[1]) {
+  return HelperSwitchDevice::readChannelAccess(mBus, mAddress, data);
+}
+
+bool Esp1wire::SwitchDevice::writeChannelAccess(uint8_t data[1]) {
+  return HelperSwitchDevice::writeChannelAccess(mBus, mAddress, data);
+}
+
+bool Esp1wire::SwitchDevice::setConditionalSearch(uint8_t data[3]) {
+  return HelperSwitchDevice::setConditionalSearch(mBus, mAddress, data);
+}
+
+void Esp1wire::SwitchDevice::readConfig() {
+  EspDeviceConfig devConf = espConfig.getDeviceConfig(getOneWireDeviceID());
+
+  String value = devConf.getValue(F("conditionalSearch"));
+  if (value != "" && getOneWireDeviceType() == DS2406 && (value.toInt() & 0x7F) != 0) {
+    uint8_t conSearch[1] = { (value.toInt() & 0x7F) };
+
+    if ((conSearch[0] & SourceSelectPIOStatus) != 0)
+      HelperSwitchDevice::writeStatus(mBus, mAddress, conSearch);
+  }
+}
+
 // class CounterDevice
 bool Esp1wire::CounterDevice::getCounter(uint32_t *counter1, uint32_t *counter2) {
-  if (mDeviceType != DeviceTypeSwitch)
+  if (mDeviceType != DeviceTypeCounter)
     return false;
 
   return counter(counter1, counter2);
@@ -988,18 +1145,28 @@ bool Esp1wire::BatteryDevice::requestTemperatureC(float *temperature) {
   return HelperBatteryDevice::requestTemperatureC(mBus, mAddress, temperature);
 }
 
-bool Esp1wire::BatteryDevice::readBattery(float *voltage, float *current, float *capacity, float resistorSens) {
-  if (mDeviceType != DeviceTypeBattery)
-    return false;
-
-  return HelperBatteryDevice::readBattery(mBus, mAddress, voltage, current, capacity, resistorSens);
+bool Esp1wire::BatteryDevice::requestVDD(float *voltage, float *current, float *capacity, float resistorSens) {
+  return requestBattery(InputSelectVDD, voltage, current, capacity, resistorSens);
 }
 
-bool Esp1wire::BatteryDevice::requestBattery(float *voltage, float *current, float *capacity, float resistorSens) {
+bool Esp1wire::BatteryDevice::requestVAD(float *voltage, float *current, float *capacity, float resistorSens) {
+  return requestBattery(InputSelectVAD, voltage, current, capacity, resistorSens);
+}
+
+bool Esp1wire::BatteryDevice::requestBattery(InputSelect inputSelect, float *voltage, float *current, float *capacity, float resistorSens) {
   if (mDeviceType != DeviceTypeBattery)
     return false;
 
-  return HelperBatteryDevice::requestBattery(mBus, mAddress, voltage, current, capacity, resistorSens);
+  bool result = HelperBatteryDevice::requestBattery(mBus, mAddress, inputSelect, voltage, current, capacity, resistorSens);
+
+  return result;
+}
+
+void Esp1wire::BatteryDevice::readConfig() {
+  EspDeviceConfig devConf = espConfig.getDeviceConfig(getOneWireDeviceID());
+
+  String value = devConf.getValue(F("requestVdd"));
+  setRequestVdd(value == "1");
 }
 
 // class HelperTemperatureDevice
@@ -1014,7 +1181,7 @@ bool Esp1wire::HelperTemperatureDevice::requestTemperatures(Bus *bus) {
 
   bus->wireWriteByte(owtcStartConversion);
   unsigned long now = millis(), delms = 750; // TODO delms depends on resolution (max yet)
-  while (!isConversionComplete(bus) && (millis() - delms < now))
+  while (!HelperDevice::isConversionComplete(bus) && (millis() - delms < now))
     ;
 
   // disable parasite
@@ -1024,7 +1191,7 @@ bool Esp1wire::HelperTemperatureDevice::requestTemperatures(Bus *bus) {
   return true;
 }
 
-bool Esp1wire::HelperTemperatureDevice::requestTemperatures(Bus *bus, uint8_t *address) {
+bool Esp1wire::HelperTemperatureDevice::requestTemperature(Bus *bus, uint8_t *address) {
   if (!bus->reset())
     return false;
   bus->wireSelect(address);
@@ -1035,7 +1202,7 @@ bool Esp1wire::HelperTemperatureDevice::requestTemperatures(Bus *bus, uint8_t *a
 
   bus->wireWriteByte(owtcStartConversion);
   unsigned long now = millis(), delms = 750; // TODO delms depends on resolution (max yet)
-  while (!isConversionComplete(bus) && (millis() - delms < now))
+  while (!HelperDevice::isConversionComplete(bus) && (millis() - delms < now))
     ;
 
   // disable parasite
@@ -1043,15 +1210,6 @@ bool Esp1wire::HelperTemperatureDevice::requestTemperatures(Bus *bus, uint8_t *a
     bus->setPowerSupply(false);
 
   return true;
-}
-
-bool Esp1wire::HelperTemperatureDevice::isConversionComplete(Bus *bus) {
-  if (bus->parasite())  // no completion in parasite mode
-    return false;
-
-  uint8_t b = bus->wireReadBit();
-
-  return (b == 1);
 }
 
 bool Esp1wire::HelperTemperatureDevice::readScratch(Bus *bus, uint8_t *address, uint8_t data[9]) {
@@ -1143,6 +1301,19 @@ bool Esp1wire::HelperTemperatureDevice::powerSupply(Bus *bus, uint8_t *address) 
 
 // class HelperSwitchDevice
 bool Esp1wire::HelperSwitchDevice::readStatus(Bus *bus, uint8_t *address, SwitchMemoryStatus *memoryStatus) {
+  switch (address[0]) {
+    case DS2406:
+      return HelperSwitchDevice::readStatusDS2406(bus, address, memoryStatus);
+      break;
+    default:
+      Serial.println("HelperSwitchDevice::readStatus: 0x" + String(address[0], HEX) + " unsupported");
+      break;
+  }
+
+  return false;
+}
+
+bool Esp1wire::HelperSwitchDevice::readStatusDS2406(Bus *bus, uint8_t *address, SwitchMemoryStatus *memoryStatus) {
   uint8_t cmd[3] = {
     owscReadStatus    // command
     , 0, 0            // address TA1 & TA2
@@ -1174,7 +1345,23 @@ bool Esp1wire::HelperSwitchDevice::readStatus(Bus *bus, uint8_t *address, Switch
   return result;
 }
 
-bool Esp1wire::HelperSwitchDevice::writeStatus(Bus *bus, uint8_t *address, uint8_t data[1]) {
+bool Esp1wire::HelperSwitchDevice::writeStatus(Bus *bus, uint8_t *address, uint8_t data[3]) {
+  switch (address[0]) {
+    case DS2406:
+      return HelperSwitchDevice::writeStatusDS2406(bus, address, data);
+      break;
+    case DS2408:
+      return HelperSwitchDevice::writeStatusDS2408(bus, address, data);
+      break;
+    default:
+      Serial.println("HelperSwitchDevice::writeStatus: 0x" + String(address[0], HEX) + " unsupported");
+      break;
+  }
+
+  return false;
+}
+
+bool Esp1wire::HelperSwitchDevice::writeStatusDS2406(Bus *bus, uint8_t *address, uint8_t data[1]) {
   bool result = false;
 
   uint8_t cmd[3] = {
@@ -1202,7 +1389,38 @@ bool Esp1wire::HelperSwitchDevice::writeStatus(Bus *bus, uint8_t *address, uint8
   return result;
 }
 
+bool Esp1wire::HelperSwitchDevice::writeStatusDS2408(Bus *bus, uint8_t *address, uint8_t data[3]) {
+  uint8_t cmd[3] = {
+    owscWriteCondSearch // command
+  , 0x8B, 0x00          // address TA1 & TA2
+  }, crc[2];
+
+  if (!bus->reset())
+    return false;
+
+  bus->wireSelect(address);
+  bus->wireWriteBytes(cmd, sizeof(cmd));
+  bus->wireWriteBytes(data, 3); // selection, polarity, Control/Status register
+
+  bus->reset();
+
+  return true;
+}
+
 bool Esp1wire::HelperSwitchDevice::channelAccessInfo(Bus *bus, uint8_t *address, SwitchChannelStatus *channelStatus, bool resetAlarm) {
+  switch (address[0]) {
+    case DS2406:
+      return HelperSwitchDevice::channelAccessInfoDS2406(bus, address, channelStatus, resetAlarm);
+      break;
+    default:
+      return HelperSwitchDevice::channelAccessInfoDS2408(bus, address, channelStatus, resetAlarm);
+      break;
+  }
+
+  return false;
+}
+
+bool Esp1wire::HelperSwitchDevice::channelAccessInfoDS2406(Bus *bus, uint8_t *address, SwitchChannelStatus *channelStatus, bool resetAlarm) {
   uint8_t cmd[3] = {
     owscChannelAccess       // command
   , ccbDefault, ccbReserved // channel control bytes
@@ -1244,6 +1462,143 @@ bool Esp1wire::HelperSwitchDevice::channelAccessInfo(Bus *bus, uint8_t *address,
     }
   }
     
+  return result;
+}
+
+bool Esp1wire::HelperSwitchDevice::channelAccessInfoDS2408(Bus *bus, uint8_t *address, SwitchChannelStatus *channelStatus, bool resetAlarm) {
+  uint8_t cmd[3] = {
+    owscReadPioRegisters    // command
+  , 0x88, 0x00              // channel control bytes
+  }, crc[2], data[8];
+
+  if (!bus->reset())
+    return false;
+
+  bus->wireSelect(address);
+  bus->wireWriteBytes(cmd, sizeof(cmd));
+  bus->wireReadBytes(data, 8);  // read 6 bytes + 2 dummy
+  bus->wireReadBytes(crc, 2);   // read crc
+  bool result = bus->reset();
+
+  // commands to crc
+  uint16_t crc16 = bus->crc16(cmd, sizeof(cmd));
+  // data to crc
+  crc16 = ~bus->crc16(data, sizeof(data), crc16);
+
+  result = result && ((crc16 & 0xFF) == crc[0]) && ((crc16 >> 8) == crc[1]);
+
+  Serial.println("HelperSwitchDevice::channelAccessInfoDS2408: 0x" +
+    String(data[0], HEX) + " " +
+    String(data[1], HEX) + " " +
+    String(data[2], HEX) + " " +
+    String(data[3], HEX) + " " +
+    String(data[4], HEX) + " " +
+    String(data[5], HEX) + " " +
+    String(data[6], HEX) + " " +
+    String(data[7], HEX)
+  );
+  if (result) {
+    channelStatus->noChannels = 8;
+  }
+
+  if (resetAlarm)
+    resetActivityLatchesDS2408(bus, address);
+  
+  return result;
+}
+
+bool Esp1wire::HelperSwitchDevice::readChannelAccess(Bus *bus, uint8_t *address, uint8_t data[1]) {
+  switch (address[0]) {
+    case DS2408:
+      return HelperSwitchDevice::readChannelAccessDS2408(bus, address, data);
+      break;
+  }
+
+  return false;
+}
+
+bool Esp1wire::HelperSwitchDevice::readChannelAccessDS2408(Bus *bus, uint8_t *address, uint8_t data[1]) {
+  if (!bus->reset())
+    return false;
+
+  bus->wireSelect(address);
+  bus->wireWriteByte(owscChannelAccess);
+  bus->wireReadBytes(data, 1);
+  bool result = bus->reset();
+
+  return result;
+}
+
+bool Esp1wire::HelperSwitchDevice::writeChannelAccess(Bus *bus, uint8_t *address, uint8_t data[1]) {
+  switch (address[0]) {
+    case DS2408:
+      return HelperSwitchDevice::writeChannelAccessDS2408(bus, address, data);
+      break;
+  }
+
+  return false;
+}
+
+bool Esp1wire::HelperSwitchDevice::writeChannelAccessDS2408(Bus *bus, uint8_t *address, uint8_t data[1]) {
+  uint8_t data2[2] = { data[0], ~data[0] };
+  
+  if (!bus->reset())
+    return false;
+
+  bus->wireSelect(address);
+  bus->wireWriteByte(owscChannelAccessWrite);
+  bus->wireWriteBytes(data2, 2);   // 
+  bus->wireReadBytes(data2, 2);    // 0xAA + PIO pin status
+  bool result = bus->reset();
+
+  result = result && (data2[0] == 0xAA);
+
+  // return PIO pin status
+  data[0] = data2[1];
+
+  return result;
+}
+
+bool Esp1wire::HelperSwitchDevice::resetActivityLatchesDS2408(Bus *bus, uint8_t *address) {
+  uint8_t data[1];
+  
+  if (!bus->reset())
+    return false;
+
+  bus->wireSelect(address);
+  bus->wireWriteByte(owscResetActLatches);
+  bus->wireReadBytes(data, 1);    // 0xAA as response
+  bool result = bus->reset();
+
+  result = result && (data[0] == 0xAA);
+  
+  return result;
+}
+
+bool Esp1wire::HelperSwitchDevice::setConditionalSearch(Bus *bus, uint8_t *address, uint8_t data[3]) {
+  switch (address[0]) {
+    case DS2408:
+      return HelperSwitchDevice::setConditionalSearchDS2408(bus, address, data);
+      break;
+  }
+
+  return false;
+}
+
+bool Esp1wire::HelperSwitchDevice::setConditionalSearchDS2408(Bus *bus, uint8_t *address, uint8_t data[3]) {
+  uint8_t cmd[3] = {
+    owscWriteCondSearch     // command
+  , 0x8B, 0x00              // address
+  };
+
+  if (!bus->reset())
+    return false;
+
+  bus->wireSelect(address);
+  bus->wireWriteBytes(cmd, sizeof(cmd));
+  bus->wireWriteBytes(data, 3);
+  bool result = bus->reset();
+
   return result;
 }
 
@@ -1302,7 +1657,7 @@ bool Esp1wire::HelperBatteryDevice::readTemperatureC(Bus *bus, byte *address, fl
 }
 
 bool Esp1wire::HelperBatteryDevice::requestTemperatureC(Bus *bus, byte *address, float *temperature) {
-  bool result = HelperTemperatureDevice::requestTemperatures(bus, address);
+  bool result = HelperTemperatureDevice::requestTemperature(bus, address);
 
   if (result)
     result = readTemperatureC(bus, address, temperature);
@@ -1344,39 +1699,32 @@ bool Esp1wire::HelperBatteryDevice::readBattery(Bus *bus, byte *address, float *
   return true;
 }
 
-bool Esp1wire::HelperBatteryDevice::requestBatteries(Bus *bus) {
+bool Esp1wire::HelperBatteryDevice::requestBattery(Bus *bus, byte *address, InputSelect inputSelect, float *voltage, float *current, float *capacity, float resistorSens) {
+  uint8_t cmd[3] = {
+    owbcWriteScratch
+  , 0x00                // page
+  , 0x07                // TODO: default config IAD | CA | EE
+  };
+  
+  if (inputSelect == InputSelectVDD)
+    cmd[2] |= inputSelect;
+
   if (!bus->reset())
     return false;
-  bus->wireWriteByte(owcSkip);
 
-  // enable parasite
-  if (bus->parasite())
-    bus->setPowerSupply(true);
-
-  bus->wireWriteByte(owbcStartConversionV);
-  unsigned long now = millis(), delms = 750; // TODO delms
-  while (!HelperTemperatureDevice::isConversionComplete(bus) && (millis() - delms < now))
-    ;
-
-  // disable parasite
-  if (bus->parasite())
-    bus->setPowerSupply(false);
-
-  return true;
-}
-
-bool Esp1wire::HelperBatteryDevice::requestBattery(Bus *bus, byte *address, float *voltage, float *current, float *capacity, float resistorSens) {
-  if (!bus->reset())
-    return false;
+  // select input (VDD/VAD)
   bus->wireSelect(address);
-
+  bus->wireWriteBytes(cmd, sizeof(cmd));
+  bus->reset();
+  
+  bus->wireSelect(address);
   // enable parasite
   if (bus->parasite())
     bus->setPowerSupply(true);
 
   bus->wireWriteByte(owbcStartConversionV);
-  unsigned long now = millis(), delms = 750; // TODO delms depends on resolution (max yet)
-  while (!HelperTemperatureDevice::isConversionComplete(bus) && (millis() - delms < now))
+  unsigned long now = millis(), delms = 20; // TODO delms depends on resolution (max yet)
+  while (!HelperDevice::isConversionComplete(bus) && (millis() - delms < now))
     ;
 
   // disable parasite
@@ -1387,7 +1735,10 @@ bool Esp1wire::HelperBatteryDevice::requestBattery(Bus *bus, byte *address, floa
 }
 
 bool Esp1wire::HelperBatteryDevice::readScratch(Bus *bus, byte *address, uint8_t page, uint8_t data[8]) {
-  uint8_t cmd[2] = {
+  uint8_t recall[2] = {
+    owbcRecallMemory
+  , page
+  },  cmd[2] = {
     owbcReadScratch
   , page
   }, crc[1];
@@ -1396,12 +1747,15 @@ bool Esp1wire::HelperBatteryDevice::readScratch(Bus *bus, byte *address, uint8_t
     return false;
 
   bus->wireSelect(address);
-  bus->wireWriteBytes(cmd, sizeof(cmd));
-  bus->wireReadBytes(data, sizeof(data));
+  bus->wireWriteBytes(recall, 2);
+  bus->reset();
+  bus->wireSelect(address);
+  bus->wireWriteBytes(cmd, 2);
+  bus->wireReadBytes(data, 8);
   bus->wireReadBytes(crc, 1);   // read crc
   bool result = bus->reset();
 
-  return (bus->crc8(data, sizeof(data)) == crc[0]);
+  return (bus->crc8(data, 8) == crc[0]);
 }
         
 // class DeviceFilter
@@ -1418,7 +1772,7 @@ bool Esp1wire::DeviceFilter::hasNext() {
     mStarted = true;
     initBus(false);
 
-    if (deviceMatchFilter())          // point to matching device
+    if (mCurrentDeviceList != NULL && deviceMatchFilter())          // point to matching device
       return true;
   }
 
@@ -1488,20 +1842,10 @@ Esp1wire::TemperatureDevice* Esp1wire::TemperatureDeviceFilter::getNextDevice() 
 }
 
 // class AlarmFilter
-Esp1wire::AlarmFilter::~AlarmFilter() {
-  while (alarmList != NULL) {
-    currList = alarmList->next;
-    delete alarmList;
-    alarmList = currList;
-  }
-
-  alarmList = currList = lastList = NULL;
-};
-
 bool Esp1wire::AlarmFilter::hasNext() {
   if (!mStarted) {             // first call
     mStarted = true;
-    currList = alarmList;
+    currList = firstList;
 
     return (currList != NULL);
   }
@@ -1521,22 +1865,203 @@ Esp1wire::Device* Esp1wire::AlarmFilter::getNextDevice() {
   return currList->device;
 }
 
-// class HelperAlarmFilter
-void Esp1wire::HelperAlarmFilter::addDevice(Device *device) {
-  if (device->getIgnoreAlarmSearch())
-    return;
+// class Scheduler
+Esp1wire::Scheduler::~Scheduler() {
+  ScheduleList *curr;
+  
+  while (first != NULL) {
+    curr = first->next;
+    delete (first);
+    first = curr;
+  }
 
-  if (alarmList == NULL) {
-    alarmList = lastList = new Bus::DeviceList();
-    alarmList->device = device;
-    alarmList->next = NULL;
+  first = last = curr = NULL;
+}
+  
+void Esp1wire::Scheduler::addSchedule(uint16_t interval, ScheduleAction action, DeviceType filter) {
+  if (first == NULL) {
+    first = last = new ScheduleList();
+    first->next = NULL;
+
+    first->interval = interval * 1000;
+    first->action = action;
+    first->filter = filter;
   } else {
-    Bus::DeviceList *newList = new Bus::DeviceList();
-    newList->device = device;
-    newList->next = NULL;
+    last->next = new ScheduleList();
+    last = last->next;
+    last->next = NULL;
 
-    lastList->next = newList;
-    lastList = newList;
+    last->interval = interval * 1000;
+    last->action = action;
+    last->filter = filter;
+  }
+
+  mSchedulesCount++;
+}
+
+void Esp1wire::Scheduler::runSchedules() {
+  ScheduleList *curr = first;
+
+  unsigned long currTime = millis();
+
+  uint8_t idx = 0;
+  while (curr != NULL) {
+    if (currTime - curr->lastExecution > curr->interval) {
+      if (schedulerCallbacks[curr->action] != NULL)
+        schedulerCallbacks[curr->action](curr->filter);
+      curr->lastExecution = millis();
+    }
+
+    curr = curr->next;
+    idx++;
+  }
+}
+
+void Esp1wire::Scheduler::loadSchedules() {
+  EspConfig schedConfig = EspConfig("scheduler");
+
+  uint8_t schedules = schedConfig.getValue("schedules").toInt();
+  
+  if (schedules == 0) {
+    Serial.println("scheduler not configured! using defaults");
+    scheduler.addSchedule(5, Esp1wire::Scheduler::scheduleAlarmSearch, Esp1wire::DeviceTypeSwitch);
+    scheduler.addSchedule(120, Esp1wire::Scheduler::scheduleRequestTemperatues);
+    scheduler.addSchedule(60, Esp1wire::Scheduler::scheduleRequestBatteries);
+    scheduler.addSchedule(60, Esp1wire::Scheduler::scheduleReadCounter);
+
+    return;
+  }
+
+  for (uint8_t cnt=0; cnt<schedules; cnt++) {
+    String sched = schedConfig.getValue("#" + String(cnt)), intStr, actStr, filtStr;
+
+    uint8_t idx;
+    if (sched != "" && (idx = sched.indexOf(",")) > 0 && (intStr = sched.substring(0, idx)) != "" && intStr.toInt() > 0) {
+      sched = sched.substring(idx + 1);
+      if ((idx = sched.indexOf(",")) > 0 && (actStr = sched.substring(0, idx)) != "" && actStr.substring(0, 1) >= "0" && actStr.substring(0, 1) <= "9") {
+        sched = sched.substring(idx + 1);
+
+        if ((intStr.toInt() & 0xFFFF) > 0) {
+          DeviceType filter = DeviceTypeAll;
+  
+          switch (sched.toInt() & 0xFF) {
+            case DeviceTypeSwitch:
+              filter = DeviceTypeSwitch;
+              break;
+          }
+          switch (actStr.toInt() & 0x04) {
+            case  scheduleRequestTemperatues:
+            case scheduleRequestBatteries:
+            case scheduleReadCounter:
+            case scheduleAlarmSearch:
+            case scheduleResetSearch:
+              scheduler.addSchedule(intStr.toInt() & 0xFFFF, (ScheduleAction)actStr.toInt(), filter);
+              break;
+          }
+        }          
+      }
+    }
+  }
+}
+
+void Esp1wire::Scheduler::saveSchedules() {
+  EspConfig schedConfig = EspConfig("scheduler");
+
+  ScheduleList *curr = first;
+  uint8_t cnt = 0;
+
+  schedConfig.unsetAll();
+  
+  while (curr != NULL) {
+    schedConfig.setValue("#" + String(cnt), String(curr->interval / 1000) + "," + String(curr->action) + "," + String(curr->filter));
+    
+    curr = curr->next;
+    cnt++;
+  }
+
+  schedConfig.setValue(F("schedules"), String(cnt));
+  schedConfig.saveToFile();
+}
+
+void Esp1wire::Scheduler::registerCallback(ScheduleAction action, SchedulerCallback callback) {
+  schedulerCallbacks[action] = callback;
+}
+
+bool Esp1wire::Scheduler::getSchedule(uint8_t idx, uint16_t *interval, ScheduleAction *action, DeviceType *filter) {
+  bool result = false;
+  
+  if (idx >= mSchedulesCount)
+    return result;
+    
+  ScheduleList *curr = first;
+  uint8_t cnt = 0;
+  
+  while (curr != NULL) {
+    if (cnt != idx) {
+      curr = curr->next;
+      cnt++;
+      continue;
+    }
+
+    *interval = curr->interval / 1000;
+    *action = curr->action;
+    *filter = curr->filter;
+    result = true;
+    break;
+  }
+
+  return result;
+}
+
+void Esp1wire::Scheduler::updateSchedule(uint8_t idx, uint16_t interval, ScheduleAction action, DeviceType filter) {
+  if (idx >= mSchedulesCount)
+    return;
+    
+  ScheduleList *curr = first;
+  uint8_t cnt = 0;
+  
+  while (curr != NULL) {
+    if (cnt != idx) {
+      curr = curr->next;
+      cnt++;
+      continue;
+    }
+
+    curr->interval = interval * 1000;
+    curr->action = action;
+    curr->filter = filter;
+    break;
+  }
+}
+
+void Esp1wire::Scheduler::removeSchedule(uint8_t idx) {
+  if (idx == 0) {
+    ScheduleList *curr = first;
+    if (first == last)
+      first = last = NULL;
+    else
+      first = first->next;
+    delete (curr);
+  } else {
+    ScheduleList *curr = first, *priv = first;
+    uint8_t cnt = 0;
+    
+    while (curr != NULL) {
+      if (cnt != idx) {
+        if (curr != priv)
+          priv = curr;
+        curr = curr->next;
+        cnt++;
+        continue;
+      }
+  
+      priv->next = curr->next;
+      if (curr == last)
+        last = priv;
+      delete (curr);
+      mSchedulesCount--;
+      break;
+    }
   }
 }
 

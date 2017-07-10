@@ -2,14 +2,14 @@
 
 #include "EspConfig.h"
 
+// class EspConfig
 EspConfig::EspConfig(String appName) {
   mAppName = appName;
-  
   SPIFFS.begin();
-
   if (openRead()) {
     while (configFile.available()) {
       String data = configFile.readStringUntil('\n');
+
       int idx;
       if (data.startsWith("'") && data.endsWith("'") && (idx = data.indexOf("' = '")) > 0) {
         setValue(data.substring(1, idx), data.substring(idx + 5, data.length() - 1));
@@ -30,11 +30,11 @@ EspConfig::~EspConfig() {
 }
 
 bool EspConfig::openRead() {
-  return (configFile = configFile = SPIFFS.open(fileName().c_str(), "r"));
+  return (configFile = SPIFFS.open(fileName().c_str(), "r"));
 }
 
 bool EspConfig::openWrite() {
-  return (configFile = configFile = SPIFFS.open(fileName().c_str(), "w"));
+  return (configFile = SPIFFS.open(fileName().c_str(), "w"));
 }
 
 String EspConfig::getValue(String name) {
@@ -62,6 +62,8 @@ void EspConfig::setValue(String name, String value) {
     ConfigList *curr = first;
     while (curr != NULL) {
       if (curr->name == name) {
+        if (curr->value == value)
+          return;
         curr->value = value;
         break;
       }
@@ -83,6 +85,8 @@ void EspConfig::setValue(String name, String value) {
 }
 
 void EspConfig::unsetValue(String name) {
+  bool deleted = false;
+
   ConfigList *curr = first, *last = first;
   while (curr != NULL) {
     if (curr->name == name) {
@@ -91,21 +95,31 @@ void EspConfig::unsetValue(String name) {
       else
         last->next = curr->next;
       delete (curr);
+      deleted = true;
       break;
     }
     if (curr != first)
       last = curr;
     curr = curr->next;
   }
+
+  if (deleted)
+    configChanged = true;
 }
 
 void EspConfig::unsetAll() {
+  bool deleted = false;
+
   ConfigList *curr = first;
   while (curr != NULL) {
     first = curr->next; 
     delete (curr);
     curr = first;
+    deleted = true;
   }
+
+  if (deleted)
+    configChanged = true;
 }
 
 bool EspConfig::saveToFile() {
@@ -126,8 +140,17 @@ bool EspConfig::saveToFile() {
     configFile.close();
     configChanged = false;
     result = true;
-  }
+  } else
+    Serial.println("saveToFile: " + fileName() + " failed!");
 
   return result;
+}
+
+EspDeviceConfig EspConfig::getDeviceConfig(String deviceName) {
+  return EspDeviceConfig(deviceName);
+}
+
+// class EspDeviceConfig
+EspDeviceConfig::EspDeviceConfig(String deviceName) : EspConfig(deviceName) {
 }
 
